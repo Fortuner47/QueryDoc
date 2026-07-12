@@ -1,0 +1,24 @@
+[project]
+name = "querydoc"
+version = "1.0.0"
+description = "AI-powered document assistant using Retrieval-Augmented Generation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ipykernel>=7.3.0",
+    "langchain>=1.3.12",
+    "langchain-community>=0.4.2",
+    "langchain-core>=1.4.9",
+    "pymupdf>=1.28.0",
+    "pypdf>=6.14.2",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "python-multipart>=0.0.9",
+    "aiofiles>=24.1.0",
+    "docx2txt>=0.8",
+    "langchain-groq>=0.3.0",
+    "langchain-text-splitters>=0.3.0",
+    "sentence-transformers>=3.0.0",
+    "faiss-cpu>=1.8.0",
+    "python-dotenv>=1.0.0",
+]
