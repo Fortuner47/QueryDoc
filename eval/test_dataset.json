@@ -1,0 +1,12 @@
+[
+  {
+    "question": "Why do critics label Cristiano Ronaldo a penalty merchant?",
+    "expected_context": "penalty merchant",
+    "expected_answer": "Critics label him this because a significant number of his career goals have come from the penalty spot, and they argue he actively seeks penalties."
+  },
+  {
+    "question": "How many career goals has Ronaldo scored according to his supporters?",
+    "expected_context": "900",
+    "expected_answer": "Supporters point out he has scored over 900 career goals from open play, headers, free kicks, and penalties combined."
+  }
+]

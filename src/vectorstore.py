@@ -2,13 +2,13 @@ import os
 import faiss
 import numpy as np
 import pickle
+import re
 from typing import List, Any, Dict, Optional
 from sentence_transformers import SentenceTransformer
 from src.embedding import EmbeddingPipeline
-
+from rank_bm25 import BM25Okapi
 
 class FaissVectorStore:
-
     def __init__(
         self,
         persist_dir: str = "faiss_store",
@@ -21,6 +21,8 @@ class FaissVectorStore:
 
         self.index = None
         self.metadata = []
+        self.corpus = []
+        self.bm25 = None
 
         self.embedding_model = embedding_model
         self.model = SentenceTransformer(embedding_model)
@@ -29,6 +31,17 @@ class FaissVectorStore:
         self.chunk_overlap = chunk_overlap
 
         print(f"[INFO] Loaded embedding model: {embedding_model}")
+
+    def _tokenize(self, text: str) -> List[str]:
+        return re.findall(r'\w+', text.lower())
+
+    def _rebuild_bm25(self):
+        if self.metadata:
+            self.corpus = [self._tokenize(m.get("text", "")) for m in self.metadata]
+            self.bm25 = BM25Okapi(self.corpus)
+        else:
+            self.corpus = []
+            self.bm25 = None
 
     def build_from_documents(self, documents: List[Any]):
         print(f"[INFO] Building vector store from {len(documents)} raw documents...")
@@ -52,15 +65,12 @@ class FaissVectorStore:
             metadatas,
         )
 
+        self._rebuild_bm25()
         self.save()
 
         print(f"[INFO] Vector store built and saved to {self.persist_dir}")
 
     def add_documents(self, documents: List[Any], source_id: str = None) -> int:
-        """
-        Add documents incrementally to the existing index.
-        Returns the number of chunks added.
-        """
         emb_pipe = EmbeddingPipeline(
             model_name=self.embedding_model,
             chunk_size=self.chunk_size,
@@ -75,7 +85,6 @@ class FaissVectorStore:
             meta = {"text": chunk.page_content}
             if source_id:
                 meta["source_id"] = source_id
-            # Preserve any existing metadata from the document
             if hasattr(chunk, "metadata") and chunk.metadata:
                 meta["source_filename"] = chunk.metadata.get("source_filename", "")
                 meta["source_path"] = chunk.metadata.get("source_path", "")
@@ -87,37 +96,30 @@ class FaissVectorStore:
             metadatas,
         )
 
+        self._rebuild_bm25()
         self.save()
 
         print(f"[INFO] Incrementally added {len(chunks)} chunks for source: {source_id}")
         return len(chunks)
 
     def delete_by_source(self, source_id: str) -> bool:
-        """
-        Delete all embeddings associated with a source_id.
-        Rebuilds the index without those vectors.
-        """
         if self.index is None or not self.metadata:
             return False
 
-        # Find indices to keep
         keep_indices = []
         for i, meta in enumerate(self.metadata):
             if meta.get("source_id") != source_id:
                 keep_indices.append(i)
 
         if len(keep_indices) == len(self.metadata):
-            print(f"[INFO] No vectors found for source: {source_id}")
             return False
 
         removed_count = len(self.metadata) - len(keep_indices)
 
         if len(keep_indices) == 0:
-            # All vectors removed, reset index
             self.index = None
             self.metadata = []
         else:
-            # Reconstruct index with remaining vectors
             dim = self.index.d
             all_vectors = np.array([
                 self.index.reconstruct(i) for i in keep_indices
@@ -125,28 +127,20 @@ class FaissVectorStore:
 
             new_index = faiss.IndexFlatL2(dim)
             new_index.add(all_vectors)
-
-            new_metadata = [self.metadata[i] for i in keep_indices]
-
             self.index = new_index
-            self.metadata = new_metadata
+            self.metadata = [self.metadata[i] for i in keep_indices]
 
+        self._rebuild_bm25()
         self.save()
         print(f"[INFO] Deleted {removed_count} vectors for source: {source_id}")
         return True
 
-    def add_embeddings(
-        self,
-        embeddings: np.ndarray,
-        metadatas: List[Any] = None,
-    ):
+    def add_embeddings(self, embeddings: np.ndarray, metadatas: List[Any] = None):
         dim = embeddings.shape[1]
-
         if self.index is None:
             self.index = faiss.IndexFlatL2(dim)
 
         self.index.add(embeddings)
-
         if metadatas:
             self.metadata.extend(metadatas)
 
@@ -159,7 +153,6 @@ class FaissVectorStore:
         if self.index is not None:
             faiss.write_index(self.index, faiss_path)
         else:
-            # Remove old index files if index is empty
             if os.path.exists(faiss_path):
                 os.remove(faiss_path)
             if os.path.exists(meta_path):
@@ -180,95 +173,104 @@ class FaissVectorStore:
             return
 
         self.index = faiss.read_index(faiss_path)
-
         with open(meta_path, "rb") as f:
             self.metadata = pickle.load(f)
-
+            
+        self._rebuild_bm25()
         print(f"[INFO] Loaded Faiss index and metadata from {self.persist_dir}")
 
-    def search(
-        self,
-        query_embedding: np.ndarray,
-        top_k: int = 5,
-    ):
+    def search_dense(self, query_embedding: np.ndarray, top_k: int = 5):
         if self.index is None or self.index.ntotal == 0:
             return []
 
-        # Clamp top_k to available vectors
         actual_k = min(top_k, self.index.ntotal)
         D, I = self.index.search(query_embedding, actual_k)
-
+        
         results = []
-
         for idx, dist in zip(I[0], D[0]):
             if idx < 0:
                 continue
             meta = self.metadata[idx] if idx < len(self.metadata) else None
-
-            # Convert L2 distance to a similarity score (0-1 range)
-            # For normalized vectors: similarity = 1 - (distance / 2)
-            # For general case, use exponential decay
             similarity = float(1.0 / (1.0 + dist))
-
-            results.append(
-                {
-                    "index": int(idx),
-                    "distance": float(dist),
-                    "similarity": similarity,
-                    "metadata": meta,
-                }
-            )
-
+            results.append({
+                "index": int(idx),
+                "distance": float(dist),
+                "similarity": similarity,
+                "metadata": meta,
+                "dense_score": similarity
+            })
         return results
 
-    def query(
-        self,
-        query_text: str,
-        top_k: int = 5,
-        min_similarity: float = 0.0,
-    ) -> List[Dict]:
+    def query(self, query_text: str, top_k: int = 5, min_similarity: float = 0.0) -> List[Dict]:
         """
-        Query the vector store with optional minimum similarity filtering.
+        Hybrid search using Reciprocal Rank Fusion (RRF) of Dense and Sparse results.
         """
-        print(f"[INFO] Querying vector store for: '{query_text}'")
+        print(f"[INFO] Querying hybrid vector store for: '{query_text}'")
 
         if self.index is None or self.index.ntotal == 0:
-            print("[WARN] Vector store is empty.")
             return []
 
-        query_emb = self.model.encode(
-            [query_text]
-        ).astype("float32")
+        # 1. Dense Search
+        query_emb = self.model.encode([query_text]).astype("float32")
+        dense_results = self.search_dense(query_emb, top_k=top_k * 2)
 
-        results = self.search(
-            query_emb,
-            top_k=top_k,
-        )
+        # 2. Sparse Search (BM25)
+        bm25_results = []
+        if self.bm25:
+            tokenized_query = self._tokenize(query_text)
+            bm25_scores = self.bm25.get_scores(tokenized_query)
+            # get top k indices
+            top_bm25_idx = np.argsort(bm25_scores)[::-1][:top_k * 2]
+            for idx in top_bm25_idx:
+                score = bm25_scores[idx]
+                if score > 0:
+                    bm25_results.append({
+                        "index": int(idx),
+                        "bm25_score": float(score)
+                    })
 
-        # Filter by minimum similarity
+        # 3. Reciprocal Rank Fusion (RRF)
+        k = 60
+        rrf_scores = {}
+        
+        for rank, res in enumerate(dense_results):
+            idx = res["index"]
+            if idx not in rrf_scores:
+                rrf_scores[idx] = {"score": 0.0, "meta": res["metadata"], "similarity": res["similarity"]}
+            rrf_scores[idx]["score"] += 1.0 / (k + rank + 1)
+            
+        for rank, res in enumerate(bm25_results):
+            idx = res["index"]
+            if idx not in rrf_scores:
+                rrf_scores[idx] = {"score": 0.0, "meta": self.metadata[idx], "similarity": 0.0}
+            rrf_scores[idx]["score"] += 1.0 / (k + rank + 1)
+            
+        fused_results = []
+        for idx, data in rrf_scores.items():
+            fused_results.append({
+                "index": idx,
+                "similarity": data["similarity"],
+                "rrf_score": data["score"],
+                "metadata": data["meta"]
+            })
+            
+        fused_results.sort(key=lambda x: x["rrf_score"], reverse=True)
+        final_results = fused_results[:top_k]
+        
         if min_similarity > 0:
-            results = [r for r in results if r["similarity"] >= min_similarity]
+            final_results = [r for r in final_results if r["similarity"] >= min_similarity]
 
-        return results
+        return final_results
 
     def get_stats(self) -> Dict:
-        """Return index statistics."""
         if self.index is None:
-            return {
-                "total_vectors": 0,
-                "dimension": 0,
-                "index_loaded": False,
-            }
-
+            return {"total_vectors": 0, "dimension": 0, "index_loaded": False}
         return {
             "total_vectors": int(self.index.ntotal),
             "dimension": int(self.index.d),
             "index_loaded": True,
+            "has_bm25": self.bm25 is not None
         }
 
     def get_chunks_by_source(self, source_id: str) -> int:
-        """Count chunks belonging to a specific source."""
-        return sum(
-            1 for m in self.metadata
-            if m.get("source_id") == source_id
-        )
+        return sum(1 for m in self.metadata if m.get("source_id") == source_id)
